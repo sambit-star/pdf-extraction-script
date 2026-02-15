@@ -10,6 +10,12 @@ import sys
 from pathlib import Path
 import argparse
 
+try:
+    import PyPDF2
+except ImportError:
+    print("Error: PyPDF2 is not installed. Please install it using: pip install PyPDF2")
+    sys.exit(1)
+
 
 def extract_pdf_data(pdf_path):
     """
@@ -21,12 +27,6 @@ def extract_pdf_data(pdf_path):
     Returns:
         Dictionary containing extracted data
     """
-    try:
-        import PyPDF2
-    except ImportError:
-        print("Error: PyPDF2 is not installed. Please install it using: pip install PyPDF2")
-        sys.exit(1)
-    
     extracted_data = {
         "file_name": os.path.basename(pdf_path),
         "file_path": str(pdf_path),
@@ -62,8 +62,17 @@ def extract_pdf_data(pdf_path):
         
         return extracted_data
     
+    except FileNotFoundError:
+        print(f"Error: PDF file not found at {pdf_path}")
+        sys.exit(1)
+    except PermissionError:
+        print(f"Error: Permission denied when trying to read {pdf_path}")
+        sys.exit(1)
+    except PyPDF2.errors.PdfReadError as e:
+        print(f"Error: Invalid or corrupted PDF file - {str(e)}")
+        sys.exit(1)
     except Exception as e:
-        print(f"Error extracting data from PDF: {str(e)}")
+        print(f"Error: Unexpected error while extracting data from PDF - {str(e)}")
         sys.exit(1)
 
 
@@ -86,9 +95,15 @@ def save_json(data, output_dir, pdf_filename):
         
         print(f"✓ Successfully extracted data from PDF")
         print(f"✓ JSON output saved to: {output_path}")
-        
+    
+    except PermissionError:
+        print(f"Error: Permission denied when trying to write to {output_path}")
+        sys.exit(1)
+    except OSError as e:
+        print(f"Error: Failed to write JSON file - {str(e)}")
+        sys.exit(1)
     except Exception as e:
-        print(f"Error saving JSON file: {str(e)}")
+        print(f"Error: Unexpected error while saving JSON file - {str(e)}")
         sys.exit(1)
 
 
