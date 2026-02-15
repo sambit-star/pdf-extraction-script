@@ -77,7 +77,14 @@ def _clean(text):
 
 
 def _extract_gstn(text, *labels):
-    """Extract GST number following any of the given labels."""
+    """Extract GST number following any of the given labels.
+
+    Handles common label variants: GSTIN No, GSTN No, GSTIN, GSTIN/UIN,
+    GST NO, GSTNO, etc.
+    """
+    # Default set of labels when none are provided explicitly
+    if not labels:
+        labels = ("GSTIN/UIN", "GSTIN No", "GSTN No", "GSTIN", "GST NO", "GSTNO")
     for label in labels:
         pattern = re.compile(
             re.escape(label) + r"\s*:?\s*([0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][0-9A-Z][A-Z][0-9A-Z])",
@@ -87,6 +94,19 @@ def _extract_gstn(text, *labels):
         if m:
             return m.group(1)
     return ""
+
+
+# GSTN regex for extracting all 15-character GST numbers from a block
+_GSTN_RE = re.compile(r"\b([0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][0-9A-Z][A-Z][0-9A-Z])\b")
+
+
+def _find_all_unique_gstns(text):
+    """Return a list of unique GSTN numbers in order of appearance."""
+    seen = []
+    for g in _GSTN_RE.findall(text):
+        if g not in seen:
+            seen.append(g)
+    return seen
 
 
 def _parse_indian_number(s):
@@ -157,18 +177,24 @@ def _extract_mogli(pages):
     # Invoice type
     invoice_type = "TAX INVOICE"
 
-    # Vendor name: after "Billed From:" or at top
+    # Vendor name: after "Billed From:" / "Name:" or pick from first line
     vendor_name = ""
     m = re.search(r"Billed\s+From\s*:\s*\n?\s*Name\s*:\s*(.+)", first_page, re.IGNORECASE)
     if m:
         vendor_name = m.group(1).strip()
     if not vendor_name:
-        m = re.search(r"(Mogli\s+Labs\s*\(India\)\s*Private\s+Limited)", full_text, re.IGNORECASE)
+        # Try first prominent company name line
+        m = re.search(r"(Mogli\s+Labs\s*\(?India\)?\s*(?:Private|Pvt\.?)\s+Limited)", full_text, re.IGNORECASE)
         if m:
             vendor_name = m.group(1).strip()
 
-    # Vendor GSTN
-    vendor_gstn = _extract_gstn(first_page, "GSTIN No", "GSTN No", "GSTIN", "GST NO")
+    # Normalise vendor name: remove parentheses and extra spaces, upper-case
+    if vendor_name:
+        vendor_name = re.sub(r"[()]", "", vendor_name)
+        vendor_name = re.sub(r"\s+", " ", vendor_name).strip().upper()
+
+    # Vendor GSTN – try common labels
+    vendor_gstn = _extract_gstn(first_page)
 
     # Buyer name
     buyer_name = ""
@@ -178,23 +204,18 @@ def _extract_mogli(pages):
         re.IGNORECASE,
     )
     if m:
-        buyer_name = m.group(1).strip()
+        buyer_name = m.group(1).strip().upper()
 
-    # Buyer GSTN – pick the one from the "Billed To" section
+    # Buyer GSTN – look in the "Billed To" section first
     buyer_gstn = ""
-    billed_to_section = ""
-    m = re.search(r"(?:Billed\s+To|Buyer)\s*\)?.*?GSTIN\s*No\s*:\s*(\S+)", first_page, re.IGNORECASE | re.DOTALL)
+    m = re.search(r"(?:Billed\s+To|Buyer)\s*\)?.*?GSTIN?\s*(?:No\.?)?\s*:\s*(\S+)", first_page, re.IGNORECASE | re.DOTALL)
     if m:
         candidate = m.group(1)
-        if re.match(r"[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]", candidate):
+        if _GSTN_RE.match(candidate):
             buyer_gstn = candidate
     if not buyer_gstn:
-        # Find all GSTNs and take the second unique one
-        all_gstns = re.findall(r"[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][0-9A-Z][A-Z][0-9A-Z]", first_page)
-        unique = []
-        for g in all_gstns:
-            if g not in unique:
-                unique.append(g)
+        # Fallback: find all GSTNs and take the second unique one
+        unique = _find_all_unique_gstns(first_page)
         if len(unique) >= 2:
             buyer_gstn = unique[1]
 
@@ -206,7 +227,7 @@ def _extract_mogli(pages):
 
     # Invoice No
     invoice_no = ""
-    m = re.search(r"Invoice\s+No\s*:\s*(\S+)", first_page, re.IGNORECASE)
+    m = re.search(r"Invoice\s+No\.?\s*:\s*(\S+)", first_page, re.IGNORECASE)
     if m:
         invoice_no = m.group(1).strip()
 
@@ -220,19 +241,21 @@ def _extract_mogli(pages):
     # Format: S.No Description HSN Qty Unit UnitPrice TaxableTotal CGST% CGSTAmount SGST% SGSTAmount Amount
     rows = []
 
-    # Find the table section
-    table_start = first_page.find("S.No")
-    if table_start < 0:
-        table_start = first_page.find("S. No")
-    grand_total_pos = first_page.find("Grand Total")
-    if table_start >= 0 and grand_total_pos >= 0:
-        table_text = first_page[table_start:grand_total_pos]
-    elif table_start >= 0:
-        table_text = first_page[table_start:]
-    else:
-        table_text = ""
+    # Find the table section – search all pages
+    for page_text in pages:
+        page_text = _clean(page_text)
+        table_start = page_text.find("S.No")
+        if table_start < 0:
+            table_start = page_text.find("S. No")
+        if table_start < 0:
+            continue
 
-    if table_text:
+        grand_total_pos = page_text.find("Grand Total", table_start)
+        if grand_total_pos >= 0:
+            table_text = page_text[table_start:grand_total_pos]
+        else:
+            table_text = page_text[table_start:]
+
         # Remove header line
         header_end = table_text.find("\n")
         if header_end >= 0:
@@ -276,9 +299,9 @@ def _extract_mogli(pages):
 
             rows.append({
                 "Invoice Type": invoice_type,
-                "Vendor Name (Billed From)": re.sub(r"[()]", "", vendor_name).upper() if vendor_name else "",
+                "Vendor Name (Billed From)": vendor_name,
                 "Vendor GSTN (Billed From GSTN)": vendor_gstn,
-                "Buyer Name (Billed To)": buyer_name.upper() if buyer_name else "",
+                "Buyer Name (Billed To)": buyer_name,
                 "Buyer GSTIN (Billed To GSTN)": buyer_gstn,
                 "Place of Suply": place_of_supply,
                 "Invoice No": invoice_no,
@@ -312,19 +335,16 @@ def _extract_sdi(pages):
 
     invoice_type = "TAX INVOICE"
 
-    # Vendor name
+    # Vendor name – extract from the header of the invoice
     vendor_name = ""
-    m = re.search(r"(SDI\s+Business\s+Services\s+India\s+Pvt\s+Ltd)", full_text, re.IGNORECASE)
+    m = re.search(r"(SDI\s+Business\s+Services\s+India\s+Pvt\.?\s+Ltd)", full_text, re.IGNORECASE)
     if m:
         vendor_name = m.group(1).strip()
 
-    # Vendor GSTN
-    vendor_gstn = ""
-    m = re.search(r"GSTIN/UIN\s*:\s*([0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][0-9A-Z][A-Z][0-9A-Z])", first_page)
-    if m:
-        vendor_gstn = m.group(1)
+    # Vendor GSTN – try common label variants
+    vendor_gstn = _extract_gstn(first_page)
 
-    # Buyer name and GSTN
+    # Buyer name – try "Buyer (Bill to)" then "Consignee" as fallback
     buyer_name = ""
     buyer_gstn = ""
     buyer_match = re.search(
@@ -332,15 +352,20 @@ def _extract_sdi(pages):
     )
     if buyer_match:
         buyer_name = buyer_match.group(1).strip()
+    if not buyer_name:
+        buyer_match = re.search(
+            r"Consignee\s*\(Ship\s+to\)\s*\n(.+?)(?:\n|$)", first_page, re.IGNORECASE
+        )
+        if buyer_match:
+            buyer_name = buyer_match.group(1).strip()
 
-    # Get all GSTNs from text, the second unique one is the buyer
-    all_gstns = re.findall(r"[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][0-9A-Z][A-Z][0-9A-Z]", first_page)
-    unique_gstns = []
-    for g in all_gstns:
-        if g not in unique_gstns:
-            unique_gstns.append(g)
+    # Get all GSTNs from text; the first is vendor, subsequent unique ones are buyer
+    unique_gstns = _find_all_unique_gstns(first_page)
     if vendor_gstn and len(unique_gstns) >= 2:
-        buyer_gstn = unique_gstns[1] if unique_gstns[0] == vendor_gstn else unique_gstns[0]
+        for g in unique_gstns:
+            if g != vendor_gstn:
+                buyer_gstn = g
+                break
     elif len(unique_gstns) >= 2:
         buyer_gstn = unique_gstns[1]
 
@@ -394,7 +419,7 @@ def _extract_sdi(pages):
 
             taxable_total = rate * qty
 
-            # Default tax rates (will be updated from summary)
+            # Default tax rates (will be refined from per-invoice summary)
             cgst_pct = 0.09
             sgst_pct = 0.09
             igst_pct = 0
@@ -438,7 +463,7 @@ def _extract_sdi(pages):
     if tax_summary_match:
         summary_cgst_rate = int(tax_summary_match.group(4)) / 100.0
         summary_sgst_rate = int(tax_summary_match.group(6)) / 100.0 if tax_summary_match.group(6) else summary_cgst_rate
-        # Update rows with correct rates
+        # Update rows with correct rates from THIS invoice's summary
         for row in rows:
             row["CGST %"] = summary_cgst_rate
             row["SGST %"] = summary_sgst_rate
@@ -461,31 +486,46 @@ def _extract_jll(pages):
 
     invoice_type = "TAX INVOICE"
 
-    # Vendor name
-    vendor_name = "Jones Lang LaSalle Property Consultants(India) Private Ltd"
+    # Vendor name – extract from the "Bill From" section
+    vendor_name = ""
+    m = re.search(r"Bill\s+From\s*:\s*\n\s*(.+?)(?:\n|$)", first_page, re.IGNORECASE)
+    if m:
+        vendor_name = _clean(m.group(1))
+    if not vendor_name:
+        # Fallback: look for the known company pattern anywhere in the text
+        m = re.search(
+            r"(Jones\s+Lang\s+LaSalle\s+Property\s+Consultants\s*\(?India\)?\s*(?:Private|Pvt\.?)\s+Ltd\.?)",
+            full_text,
+            re.IGNORECASE,
+        )
+        if m:
+            vendor_name = m.group(1).strip()
 
-    # Vendor GSTN
-    vendor_gstn = _extract_gstn(first_page, "GST NO", "GSTIN", "GSTN")
+    # Vendor GSTN – try common label variants
+    vendor_gstn = _extract_gstn(first_page)
 
-    # Buyer name
+    # Buyer name – extract from "Bill To" section
     buyer_name = ""
     m = re.search(r"Bill\s+To\s*:\s*\n\s*(.+?)(?:\n|$)", first_page, re.IGNORECASE)
     if m:
         raw_name = _clean(m.group(1))
-        # Fix joined words like "Schneider ElectricITBusiness IndiaPrivate"
+        # Fix joined words from PDF text extraction (e.g. "ElectricITBusiness" → "Electric IT Business")
         raw_name = re.sub(r"([a-z])([A-Z])", r"\1 \2", raw_name)
-        # Fix specific known patterns
-        raw_name = re.sub(r"Electric\s+I\s*T\s*Business", "Electric IT Business", raw_name)
-        raw_name = re.sub(r"India\s+Private\s*$", "India Private Limited", raw_name)
+        # Fix spacing in common abbreviations
+        raw_name = re.sub(r"\bI\s*T\s*Business\b", "IT Business", raw_name)
+        raw_name = re.sub(r"\bIndia\s+Private\s*$", "India Private Limited", raw_name)
         buyer_name = raw_name
+
+    # If buyer name looks incomplete, try the summary page entity name
+    if not buyer_name or len(buyer_name) < 10:
+        summary_page = _clean(pages[-1]) if pages else ""
+        m = re.search(r"Entity\s+Name\s*.*?\n\s*\S+\s+(.+?)\s+SE-IN", summary_page, re.IGNORECASE)
+        if m:
+            buyer_name = _clean(m.group(1))
 
     # Buyer GSTN
     buyer_gstn = ""
-    all_gstns = re.findall(r"[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][0-9A-Z][A-Z][0-9A-Z]", first_page)
-    unique_gstns = []
-    for g in all_gstns:
-        if g not in unique_gstns:
-            unique_gstns.append(g)
+    unique_gstns = _find_all_unique_gstns(first_page)
     if vendor_gstn and len(unique_gstns) >= 2:
         for g in unique_gstns:
             if g != vendor_gstn:
@@ -494,13 +534,15 @@ def _extract_jll(pages):
     elif len(unique_gstns) >= 2:
         buyer_gstn = unique_gstns[1]
 
-    # Place of Supply
+    # Place of Supply – extract and strip QR-code junk characters that may follow
     place_of_supply = ""
     m = re.search(r"Place\s+of\s+Supply\s*:\s*(\w[\w\s]*)", first_page, re.IGNORECASE)
     if m:
-        place_of_supply = m.group(1).strip()
-        # Only keep the state name (first word or two)
-        place_of_supply = re.split(r"[A-Z]{5,}", place_of_supply)[0].strip()
+        raw_pos = m.group(1).strip()
+        # QR code data often appears as long uppercase strings right after the state name;
+        # keep only the alphabetic words at the start
+        place_of_supply = re.match(r"([A-Za-z][a-z]+(?:\s+[A-Za-z][a-z]+)*)", raw_pos)
+        place_of_supply = place_of_supply.group(1).strip() if place_of_supply else raw_pos
 
     # Invoice Number
     invoice_no = ""
@@ -542,12 +584,14 @@ def _extract_jll(pages):
     if summary_data_lines:
         summary_line = summary_data_lines[0]
         # Extract: invoice_no entity_name site_name service_type service_month hsn ...
-        # The summary line starts with the invoice number
+        # The summary line starts with the invoice number.
+        # Service Type may be multi-word (e.g. "M&E Services", "Pantry Services",
+        # "Soft Services", "Housekeeping Services")
         m = re.match(
             r"(\S+)\s+"                                      # JLL invoice No
             r"(.+?)\s+"                                      # Entity Name
-            r"(SE-IN\s+[^\s]+(?:\s*-\s*[^\s]+)*(?:\s*\([^)]*\))?)\s+"  # Site Name
-            r"((?:M&E|Pantry|Soft|Hard|Housekeeping)\s*\w*)\s+"  # Service Type
+            r"(SE-IN\s+[^\s]+(?:\s*[-&]\s*[^\s]+)*(?:\s*\([^)]*\))?)\s+"  # Site Name
+            r"((?:M&E|Pantry|Soft|Hard|Housekeeping)\s*\w*(?:\s+\w+)?)\s+"  # Service Type
             r"(\d{2}-\d{2}-\d{4})\s+"                        # Service Month
             r"(\d{5,10})",                                   # HSN
             summary_line,
