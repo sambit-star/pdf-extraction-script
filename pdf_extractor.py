@@ -188,7 +188,7 @@ def _extract_mogli(pages):
         if m:
             vendor_name = m.group(1).strip()
 
-    # Normalise vendor name: remove parentheses and extra spaces, upper-case
+    # Normalize vendor name: remove parentheses and extra spaces, upper-case
     if vendor_name:
         vendor_name = re.sub(r"[()]", "", vendor_name)
         vendor_name = re.sub(r"\s+", " ", vendor_name).strip().upper()
@@ -516,7 +516,8 @@ def _extract_jll(pages):
         raw_name = re.sub(r"\bIndia\s+Private\s*$", "India Private Limited", raw_name)
         buyer_name = raw_name
 
-    # If buyer name looks incomplete, try the summary page entity name
+    # If buyer name looks incomplete (fewer than 10 chars likely means truncated
+    # or only a fragment was captured), try the summary page entity name as fallback
     if not buyer_name or len(buyer_name) < 10:
         summary_page = _clean(pages[-1]) if pages else ""
         m = re.search(r"Entity\s+Name\s*.*?\n\s*\S+\s+(.+?)\s+SE-IN", summary_page, re.IGNORECASE)
@@ -539,10 +540,12 @@ def _extract_jll(pages):
     m = re.search(r"Place\s+of\s+Supply\s*:\s*(\w[\w\s]*)", first_page, re.IGNORECASE)
     if m:
         raw_pos = m.group(1).strip()
-        # QR code data often appears as long uppercase strings right after the state name;
-        # keep only the alphabetic words at the start
-        place_of_supply = re.match(r"([A-Za-z][a-z]+(?:\s+[A-Za-z][a-z]+)*)", raw_pos)
-        place_of_supply = place_of_supply.group(1).strip() if place_of_supply else raw_pos
+        # QR code data often appears as long uppercase strings right after the state name
+        # without any space.  Split on a lowercase→uppercase(5+) boundary to remove junk.
+        raw_pos = re.split(r"(?<=[a-z])(?=[A-Z]{5,})", raw_pos)[0]
+        # Also strip any remaining long uppercase blocks that are clearly not state names
+        raw_pos = re.split(r"\s+[A-Z]{5,}", raw_pos)[0]
+        place_of_supply = raw_pos.strip()
 
     # Invoice Number
     invoice_no = ""
